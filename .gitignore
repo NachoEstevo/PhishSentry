@@ -1,0 +1,28 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor and local workspace state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temporary output
+*.log
+logs/
+tmp/
+temp/
+
+# Local secrets and release-only artifacts
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crx
+*.zip
+
+# Dependency folders if local tooling is added later
+node_modules/
