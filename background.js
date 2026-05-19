@@ -49,6 +49,8 @@ function summarizeReasons(reasons) {
     else if (text.includes("Deceptive Subdomain/Brand Inclusion")) add("Sender domain included a brand name suspiciously.");
     else if (text.includes("Link spoofing")) add("Visible link text redirected to a different domain.");
     else if (text.includes("Link redirect typosquatting")) add("A link pointed to a lookalike domain.");
+    else if (text.includes("Internationalized Domain")) add("Sender domain used internationalized or mixed-script characters.");
+    else if (text.includes("Internationalized link")) add("A link pointed to an internationalized or mixed-script domain.");
     else if (text.includes("Could not extract")) add("Sender domain could not be extracted.");
     else if (text.includes("Verified official email")) add("Sender matched a known official brand domain.");
     else if (text.toLowerCase().includes("whitelist")) add("Sender domain was trusted by the user.");

@@ -63,7 +63,8 @@ function parseSender(fromHeader) {
 
 /**
  * Extracts the second-level domain (SLD) of a hostname, taking into account
- * standard multi-part country code TLDs (e.g., example.co.uk -> example).
+ * standard multi-part country code TLDs and a small curated set of common
+ * platform public suffixes (e.g., example.co.uk -> example, app.github.io -> app).
  * 
  * @param {string} domain The full domain name (e.g. sub.paypal.co.uk)
  * @returns {string} The primary second-level domain (e.g. paypal)
@@ -72,11 +73,32 @@ function getSecondLevelDomain(domain) {
   if (!domain) return "";
   
   // Lowercase and strip any trailing dots or slashes
-  domain = domain.toLowerCase().replace(/[\/\s]+$/g, "");
+  domain = domain.toLowerCase().replace(/^https?:\/\//, "").replace(/[\/\s.]+$/g, "");
   
-  const parts = domain.split(".");
+  const parts = domain.split(".").filter(Boolean);
   if (parts.length <= 1) {
     return domain;
+  }
+
+  const knownPlatformSuffixes = new Set([
+    "appspot.com",
+    "azurewebsites.net",
+    "cloudfront.net",
+    "firebaseapp.com",
+    "github.io",
+    "herokuapp.com",
+    "netlify.app",
+    "pages.dev",
+    "vercel.app",
+    "web.app",
+    "workers.dev"
+  ]);
+
+  for (let suffixLength = Math.min(3, parts.length - 1); suffixLength >= 2; suffixLength--) {
+    const suffix = parts.slice(-suffixLength).join(".");
+    if (knownPlatformSuffixes.has(suffix)) {
+      return parts[parts.length - suffixLength - 1] || parts[0];
+    }
   }
   
   // Common double TLD intermediate parts
@@ -92,6 +114,52 @@ function getSecondLevelDomain(domain) {
   }
   
   return secondLast;
+}
+
+function hasPunycodeLabel(domain) {
+  if (!domain) return false;
+  return domain.toLowerCase().split(".").some(label => label.startsWith("xn--"));
+}
+
+function hasNonAsciiCharacters(value) {
+  return /[^\x00-\x7F]/.test(value || "");
+}
+
+function getCharacterScript(char) {
+  if (!char || !/\p{Letter}/u.test(char)) return null;
+  if (/[a-z]/i.test(char) || /\p{Script=Latin}/u.test(char)) return "Latin";
+  if (/\p{Script=Cyrillic}/u.test(char)) return "Cyrillic";
+  if (/\p{Script=Greek}/u.test(char)) return "Greek";
+  if (/\p{Script=Hebrew}/u.test(char)) return "Hebrew";
+  if (/\p{Script=Arabic}/u.test(char)) return "Arabic";
+  if (/\p{Script=Han}/u.test(char)) return "Han";
+  if (/\p{Script=Hiragana}/u.test(char)) return "Hiragana";
+  if (/\p{Script=Katakana}/u.test(char)) return "Katakana";
+  if (/\p{Script=Hangul}/u.test(char)) return "Hangul";
+  return "Other";
+}
+
+function getDomainSecuritySignals(domain) {
+  const signals = [];
+  const cleanDomain = String(domain || "").trim().toLowerCase();
+  if (!cleanDomain) return signals;
+
+  if (hasPunycodeLabel(cleanDomain)) {
+    signals.push("punycode label");
+  }
+
+  const scripts = new Set();
+  for (const char of cleanDomain.replace(/[.\-\d_]/g, "")) {
+    const script = getCharacterScript(char);
+    if (script) scripts.add(script);
+  }
+
+  const riskyMixedScripts = ["Cyrillic", "Greek", "Hebrew", "Arabic"];
+  if (hasNonAsciiCharacters(cleanDomain) && scripts.has("Latin") && riskyMixedScripts.some(script => scripts.has(script))) {
+    signals.push("mixed-script characters");
+  }
+
+  return signals;
 }
 
 /**
@@ -132,7 +200,9 @@ function getLevenshteinDistance(str1, str2) {
 const Utils = {
   parseSender,
   getSecondLevelDomain,
-  getLevenshteinDistance
+  getLevenshteinDistance,
+  getDomainSecuritySignals,
+  hasPunycodeLabel
 };
 
 if (typeof module !== "undefined" && module.exports) {

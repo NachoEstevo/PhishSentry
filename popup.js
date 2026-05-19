@@ -43,6 +43,92 @@ function normalizeDomainInput(value) {
   }
 }
 
+function getAssessmentPresentation(status, riskScore, assessment = {}) {
+  const matchedBrand = assessment.details?.matchedBrand;
+  const isWhitelisted = assessment.details?.whitelistMatched;
+
+  if (status === "phishing") {
+    return {
+      label: "High risk",
+      action: "Do not click. Verify the request outside this email.",
+      tone: "Critical signals"
+    };
+  }
+
+  if (status === "suspicious") {
+    return {
+      label: "Review",
+      action: "Inspect the sender domain and destination links before acting.",
+      tone: "Signals found"
+    };
+  }
+
+  if (status === "safe") {
+    return {
+      label: isWhitelisted ? "Trusted context" : "Known domain",
+      action: matchedBrand ? `Domain matches ${matchedBrand}. Stay cautious with unexpected requests.` : "Trusted locally. Link checks still run.",
+      tone: "No high-risk signals"
+    };
+  }
+
+  return {
+    label: "No high-risk signals",
+    action: riskScore > 0 ? "Review the listed signal before clicking." : "Use normal caution with links, invoices, and login requests.",
+    tone: "Unverified sender"
+  };
+}
+
+if (!globalThis.chrome?.storage?.local) {
+  const previewState = {
+    stats: { totalScanned: 0, safe: 0, suspicious: 0, phishing: 0 },
+    history: [],
+    customBrands: [],
+    whitelist: ["google.com", "gmail.com", "microsoft.com"]
+  };
+
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendMessage(message, callback) {
+        if (message?.action === "clearAllLogs") {
+          previewState.stats = { totalScanned: 0, safe: 0, suspicious: 0, phishing: 0 };
+          previewState.history = [];
+        }
+        if (callback) callback({ success: true });
+      }
+    },
+    storage: {
+      local: {
+        get(keys, callback) {
+          if (Array.isArray(keys)) {
+            callback(Object.fromEntries(keys.map(key => [key, previewState[key]])));
+            return;
+          }
+
+          if (typeof keys === "string") {
+            callback({ [keys]: previewState[keys] });
+            return;
+          }
+
+          callback({ ...previewState });
+        },
+        set(update, callback) {
+          Object.assign(previewState, update);
+          if (callback) callback();
+        }
+      }
+    },
+    tabs: {
+      query(_queryInfo, callback) {
+        callback([]);
+      },
+      sendMessage(_tabId, _message, callback) {
+        if (callback) callback({ success: false });
+      }
+    }
+  };
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   // Navigation Tabs Controller
   const tabs = document.querySelectorAll(".nav-tab");
@@ -173,7 +259,7 @@ function bindActiveEmailScan() {
       if (chrome.runtime.lastError || !response || !response.success) {
         container.innerHTML = `
           <div class="inactive-state">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--primary-glow)" stroke-width="1.5" class="glowing-logo"><path d="M12 22C12 22 20 18 20 12V5L12 2L4 5V12C4 18 12 22 12 22Z" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8V12"/><path d="M12 16H12.01"/></svg>
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="rgba(29,29,31,0.38)" stroke-width="1.5" class="glowing-logo"><path d="M12 22C12 22 20 18 20 12V5L12 2L4 5V12C4 18 12 22 12 22Z" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8V12"/><path d="M12 16H12.01"/></svg>
             <p>Gmail active.</p>
             <span class="help-label">Select or open a message inside Gmail to view safety audits in real-time.</span>
           </div>
@@ -187,18 +273,7 @@ function bindActiveEmailScan() {
       const displayLabel = parsedFrom.displayName || parsedFrom.email;
       const badgeClass = normalizeStatus(assessment.status);
       const riskScore = normalizeRiskScore(assessment.riskScore);
-      
-      // Determine badge class
-      let displayStatusText = badgeClass.toUpperCase();
-      if (badgeClass === "safe") {
-        displayStatusText = "VERIFIED SAFE";
-      } else if (badgeClass === "phishing") {
-        displayStatusText = "PHISHING ALERT";
-      } else if (badgeClass === "suspicious") {
-        displayStatusText = "SUSPICIOUS";
-      } else {
-        displayStatusText = "UNVERIFIED";
-      }
+      const presentation = getAssessmentPresentation(badgeClass, riskScore, assessment);
       
       let reasonsHTML = "";
       if (assessment.reasons && assessment.reasons.length > 0) {
@@ -212,9 +287,9 @@ function bindActiveEmailScan() {
       container.innerHTML = `
         <div class="scan-result-wrapper">
           <div class="assessment-header">
-            <span class="risk-label-badge ${badgeClass}">${displayStatusText}</span>
+            <span class="risk-label-badge ${badgeClass}">${escapeHtml(presentation.label)}</span>
             <div style="font-family: var(--font-title); font-weight:700;">
-              Risk Index: <span class="${badgeClass}-color">${riskScore}%</span>
+              Risk <span class="${badgeClass}-color">${riskScore}%</span>
             </div>
           </div>
           
@@ -225,6 +300,7 @@ function bindActiveEmailScan() {
           <div class="scan-details-section" style="margin-top: 6px;">
             <div class="scan-meta"><strong>Sender:</strong> ${escapeHtml(displayLabel || "Unknown sender")}</div>
             <div class="scan-meta" style="font-size:11px; color:var(--text-muted);"><strong>Domain:</strong> ${escapeHtml(parsedFrom.domain || "unknown-domain")}</div>
+            <div class="recommendation-box"><strong>${escapeHtml(presentation.tone)}.</strong> ${escapeHtml(presentation.action)}</div>
             
             ${reasonsHTML}
           </div>
@@ -265,8 +341,10 @@ function renderHistoryList() {
       const logId = escapeHtml(log.id || `${log.timestamp}-${senderDomain}`);
       
       let badgeLabel = status.toUpperCase();
-      if (status === "safe") badgeLabel = "SAFE";
-      if (status === "unknown") badgeLabel = "UNVERIFIED";
+      if (status === "safe") badgeLabel = "KNOWN";
+      if (status === "unknown") badgeLabel = "QUIET";
+      if (status === "phishing") badgeLabel = "HIGH";
+      if (status === "suspicious") badgeLabel = "REVIEW";
       
       let reasonsHTML = "";
       if (log.reasons && log.reasons.length > 0) {

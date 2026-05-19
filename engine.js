@@ -36,7 +36,7 @@ class PhishSentryEngine {
    * }}
    */
   static analyze(fromHeader, bodyLinks = [], customBrands = [], whitelist = []) {
-    const { parseSender, getSecondLevelDomain, getLevenshteinDistance } = _Utils;
+    const { parseSender, getSecondLevelDomain, getLevenshteinDistance, getDomainSecuritySignals } = _Utils;
     const { FAMOUS_BRANDS, FREE_WEBMAIL_DOMAINS } = _Brands;
     
     const parsedSender = parseSender(fromHeader);
@@ -49,25 +49,11 @@ class PhishSentryEngine {
     const allBrands = [...FAMOUS_BRANDS, ...customBrands];
     const lowercaseDomain = domain.toLowerCase();
     
-    // 1. Whitelist Check
+    // 1. Whitelist Check. This reduces sender-domain concern, but link checks still run.
     const isWhitelisted = whitelist.some(w => {
       const lowerW = w.toLowerCase().trim();
       return lowercaseDomain === lowerW || lowercaseDomain.endsWith("." + lowerW);
     });
-    
-    if (isWhitelisted) {
-      return {
-        riskScore: 0,
-        status: "safe",
-        reasons: ["Sender domain is on your trusted whitelist."],
-        details: {
-          parsedSender,
-          matchedBrand: null,
-          whitelistMatched: true,
-          linkMismatches: []
-        }
-      };
-    }
     
     if (!domain) {
       return {
@@ -81,11 +67,22 @@ class PhishSentryEngine {
     let brandMatch = null;
     let isOfficialDomain = false;
     let senderBrandStatus = null; // "verified", "spoofed", or null
+
+    if (isWhitelisted) {
+      senderBrandStatus = "trusted";
+      reasons.push("Sender domain is on your trusted whitelist. Link checks were still evaluated.");
+    }
+
+    const senderDomainSignals = getDomainSecuritySignals(domain);
+    if (!isWhitelisted && senderDomainSignals.length > 0) {
+      riskScore += 35;
+      reasons.push(`Internationalized Domain Warning: The sender domain "${domain}" uses ${senderDomainSignals.join(" and ")}. Verify it carefully before trusting this message.`);
+    }
     
     // 2. Scan for Brand Spoofing (Display Name matched against brand keywords)
     const cleanDisplayName = displayName.toLowerCase();
     
-    for (const brand of allBrands) {
+    if (!isWhitelisted) for (const brand of allBrands) {
       const keywordMatched = brand.keywords.some(keyword => {
         const lowerKeyword = keyword.toLowerCase();
         // Look for exact word boundary match to avoid greediness (e.g. "x.com" in "extra")
@@ -104,7 +101,7 @@ class PhishSentryEngine {
       }
     }
     
-    if (brandMatch) {
+    if (!isWhitelisted && brandMatch) {
       if (isOfficialDomain) {
         // Officially verified brand sender
         senderBrandStatus = "verified";
@@ -124,7 +121,7 @@ class PhishSentryEngine {
     // 3. Scan for Typosquatting / Lookalike Domains
     const senderSld = getSecondLevelDomain(domain);
     
-    if (!isOfficialDomain) {
+    if (!isWhitelisted && !isOfficialDomain) {
       for (const brand of allBrands) {
         let typosquatFlaggedForThisBrand = false;
         
@@ -144,6 +141,7 @@ class PhishSentryEngine {
           
           // Substring/prefix/suffix check (e.g., paypal-security-update.com)
           const isDeceptiveSubstring = (
+            officialSld.length >= 3 &&
             senderSld.includes(officialSld) && 
             senderSld !== officialSld && 
             !brand.domains.some(od => lowercaseDomain.endsWith(od))
@@ -167,6 +165,7 @@ class PhishSentryEngine {
     // 4. Local Link Verification Heuristics
     const linkMismatches = [];
     let highRiskLinksCount = 0;
+    let mediumRiskLinksCount = 0;
     
     for (const link of bodyLinks) {
       if (!link.href || !link.href.startsWith("http")) continue;
@@ -178,6 +177,16 @@ class PhishSentryEngine {
       const destDomain = parseUrlDomain(cleanHref);
       if (!destDomain) continue;
       const destDomainLower = destDomain.toLowerCase();
+
+      const destDomainSignals = getDomainSecuritySignals(destDomainLower);
+      if (destDomainSignals.length > 0) {
+        mediumRiskLinksCount++;
+        linkMismatches.push({
+          text: cleanText,
+          href: cleanHref,
+          reason: `Internationalized link destination: Points to "${destDomainLower}", which uses ${destDomainSignals.join(" and ")}. Verify the destination before opening.`
+        });
+      }
       
       // Heuristic 4a: Anchor Text URL vs href Mismatch
       // If the visible anchor text looks like a URL (e.g., "paypal.com" or "www.paypal.com/login")
@@ -240,6 +249,13 @@ class PhishSentryEngine {
       // Direct, highly confident link-level deception warrants immediate high risk classification
       riskScore += 80;
       riskScore += Math.min((highRiskLinksCount - 1) * 10, 20); // Scale slightly for additional links
+    }
+
+    if (mediumRiskLinksCount > 0) {
+      riskScore += Math.min(mediumRiskLinksCount * 35, 50);
+    }
+
+    if (linkMismatches.length > 0) {
       linkMismatches.forEach(m => reasons.push(m.reason));
     }
     
@@ -253,6 +269,8 @@ class PhishSentryEngine {
     } else if (senderBrandStatus === "verified" && riskScore === 0) {
       status = "safe";
       reasons.unshift(`Verified official email from ${brandMatch.name}.`);
+    } else if (senderBrandStatus === "trusted" && riskScore === 0) {
+      status = "safe";
     } else {
       status = "unknown";
     }
@@ -269,7 +287,7 @@ class PhishSentryEngine {
       details: {
         parsedSender,
         matchedBrand: brandMatch ? brandMatch.name : null,
-        whitelistMatched: false,
+        whitelistMatched: isWhitelisted,
         linkMismatches
       }
     };

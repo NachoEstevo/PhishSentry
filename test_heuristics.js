@@ -9,6 +9,7 @@
 
 const assert = require("assert");
 const PhishSentryEngine = require("./engine.js");
+const PhishSentryUtils = require("./utils.js");
 
 const testCases = [
   // --- VERIFIED BRANDS (SAFE) ---
@@ -147,6 +148,13 @@ const testCases = [
     expectedStatus: "unknown",
     expectedReasonContains: "No immediate phishing indicators found"
   },
+  {
+    name: "Generic Domain With Letter X Does Not Spoof X.com",
+    fromHeader: "Example Updates <hello@example.net>",
+    links: [],
+    expectedStatus: "unknown",
+    expectedReasonContains: "No immediate phishing indicators found"
+  },
 
   // --- WHITELIST TESTS (SAFE) ---
   {
@@ -156,6 +164,45 @@ const testCases = [
     whitelist: ["corporatesite.net"],
     expectedStatus: "safe",
     expectedReasonContains: "whitelist"
+  },
+  {
+    name: "Whitelisted Sender Still Flags Spoofed Links",
+    fromHeader: "Corporate Finance <finance@corporatesite.net>",
+    links: [
+      { text: "https://paypal.com/signin", href: "https://paypa1-login.example/login" }
+    ],
+    whitelist: ["corporatesite.net"],
+    expectedStatus: "phishing",
+    expectedReasonContains: "Link spoofing"
+  },
+  {
+    name: "Punycode Sender Domain Is Suspicious",
+    fromHeader: "Security Desk <security@xn--securemail-8ib.com>",
+    links: [],
+    expectedStatus: "suspicious",
+    expectedReasonContains: "Internationalized Domain"
+  },
+  {
+    name: "Punycode Link Destination Is Suspicious",
+    fromHeader: "Document Share <notify@workspace-updates.net>",
+    links: [
+      { text: "Open document", href: "https://xn--securemail-8ib.com/session" }
+    ],
+    expectedStatus: "suspicious",
+    expectedReasonContains: "Internationalized link"
+  }
+];
+
+const utilityTestCases = [
+  {
+    name: "GitHub Pages public suffix keeps user-owned label",
+    actual: () => PhishSentryUtils.getSecondLevelDomain("paypa1.github.io"),
+    expected: "paypa1"
+  },
+  {
+    name: "Common country-code suffix keeps registrable label",
+    actual: () => PhishSentryUtils.getSecondLevelDomain("alerts.company.com.au"),
+    expected: "company"
   }
 ];
 
@@ -192,6 +239,22 @@ function runTests() {
       passed++;
     } catch (err) {
       console.log(`[FAIL] Case #${idx + 1}: ${tc.name}`);
+      console.error(`       Error: ${err.message}`);
+      failed++;
+    }
+  });
+
+  utilityTestCases.forEach((tc, idx) => {
+    try {
+      assert.strictEqual(
+        tc.actual(),
+        tc.expected,
+        `Utility mismatch. Expected: "${tc.expected}", Got: "${tc.actual()}"`
+      );
+      console.log(`[PASS] Utility #${idx + 1}: ${tc.name}`);
+      passed++;
+    } catch (err) {
+      console.log(`[FAIL] Utility #${idx + 1}: ${tc.name}`);
       console.error(`       Error: ${err.message}`);
       failed++;
     }

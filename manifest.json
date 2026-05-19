@@ -28,6 +28,7 @@
         "brands.js",
         "utils.js",
         "engine.js",
+        "providers.js",
         "content.js"
       ]
     }

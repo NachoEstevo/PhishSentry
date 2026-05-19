@@ -1,12 +1,8 @@
 /**
- * PhishSentry Gmail Content Script (Redesigned Premium UI)
+ * PhishSentry Webmail Content Script
  * 
- * Injected into Gmail (https://mail.google.com/*).
- * Listens for open emails, extracts sender metadata and hyperlinks,
- * executes local threat analyses, and injects visual safety badges.
- * 
- * Target position: Injected directly above the email body (.a3s)
- * to avoid overlap with Gmail's native warning blocks and spam containers.
+ * Provider adapters extract sender/link metadata from supported webmail DOMs.
+ * The engine runs locally, then this script injects a compact assessment.
  */
 
 // Active state of last assessed email for Popup query sync
@@ -36,16 +32,103 @@ function normalizeStatus(status) {
   return allowedStatuses.has(status) ? status : "unknown";
 }
 
+function getAssessmentPresentation(status, riskScore, assessment) {
+  const matchedBrand = assessment.details?.matchedBrand;
+  const isWhitelisted = assessment.details?.whitelistMatched;
+
+  if (status === "phishing") {
+    return {
+      title: "High-risk phishing signals",
+      description: "Avoid links and attachments until you verify the sender outside this email.",
+      action: "Do not click. Verify the request through a trusted channel.",
+      button: "Review signals"
+    };
+  }
+
+  if (status === "suspicious") {
+    return {
+      title: "Review before clicking",
+      description: "Some sender or link signals need a second look.",
+      action: "Inspect the domain and destination links before taking action.",
+      button: "Review signals"
+    };
+  }
+
+  if (status === "safe") {
+    return {
+      title: isWhitelisted ? "Trusted domain context" : "Known brand domain",
+      description: matchedBrand ? `Sender domain matches ${matchedBrand}.` : "Sender domain is in your local trusted list.",
+      action: "No high-risk signals were found, but verify unexpected requests.",
+      button: "View details"
+    };
+  }
+
+  return {
+    title: "No high-risk signals",
+    description: "This sender is not in your known brand list.",
+    action: riskScore > 0 ? "Review the signals before clicking." : "Use normal caution for links, invoices, and login requests.",
+    button: "View details"
+  };
+}
+
+function hasCurrentMessageLinkWarnings(assessment) {
+  return (assessment.details?.linkMismatches || []).length > 0;
+}
+
+function applyTrustedSenderState(badge, senderDomain, assessment) {
+  const hasLinkWarnings = hasCurrentMessageLinkWarnings(assessment);
+  const title = badge.querySelector(".ps-badge-title");
+  const description = badge.querySelector(".ps-desc");
+  const compactConfirmation = badge.querySelector(".ps-save-confirmation");
+  const detailsConfirmation = badge.querySelector(".ps-feedback");
+  const whitelistButton = badge.querySelector(".ps-whitelist-trigger");
+
+  if (whitelistButton) {
+    whitelistButton.textContent = "Saved";
+    whitelistButton.disabled = true;
+  }
+
+  if (!hasLinkWarnings) {
+    badge.classList.remove("ps-unknown", "ps-suspicious", "ps-phishing");
+    badge.classList.add("ps-safe");
+    if (title) title.textContent = "Trusted sender saved";
+    if (description) {
+      description.textContent = `${senderDomain} is now trusted locally. Future messages from this domain will show trusted context.`;
+    }
+  } else {
+    if (title) title.textContent = "Sender trust saved";
+    if (description) {
+      description.textContent = "This sender is now trusted locally, but this message still has link warnings.";
+    }
+  }
+
+  const confirmationText = hasLinkWarnings
+    ? `${senderDomain} was added to trusted senders. Link warnings still apply to this message.`
+    : `${senderDomain} was added to trusted senders. Link checks will continue to run.`;
+
+  if (compactConfirmation) {
+    compactConfirmation.textContent = confirmationText;
+    compactConfirmation.classList.add("active");
+  }
+
+  if (detailsConfirmation) {
+    detailsConfirmation.textContent = confirmationText;
+  }
+}
+
 /**
  * Initializes the content script.
  */
 function init() {
-  console.log("PhishSentry active and monitoring Gmail thread DOM.");
+  const provider = self.PhishSentryProviders?.detectProvider();
+  if (!provider) return;
+
+  console.log(`PhishSentry active and monitoring ${provider.label}.`);
   
   // Set up mutation observer to monitor when elements are added to DOM
   const observer = new MutationObserver((mutations) => {
     clearTimeout(scanDebounceTimer);
-    scanDebounceTimer = setTimeout(auditGmailThreads, 500);
+    scanDebounceTimer = setTimeout(auditCurrentProvider, 500);
   });
   
   observer.observe(document.body, {
@@ -54,7 +137,7 @@ function init() {
   });
   
   // Initial audit
-  setTimeout(auditGmailThreads, 1500);
+  setTimeout(auditCurrentProvider, 1500);
   
   // Listen for queries from the extension popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -70,11 +153,14 @@ function init() {
 }
 
 /**
- * Scans the active Gmail DOM to locate opened email conversation frames
- * that have not been audited yet, parses them, and injects safety shields.
+ * Scans the active provider DOM to locate opened email frames that have not
+ * been audited yet, parses them, and injects safety guidance.
  */
-function auditGmailThreads() {
-  const senderElements = document.querySelectorAll("span.gD[email]:not([data-phish-sentry-audited])");
+function auditCurrentProvider() {
+  const provider = self.PhishSentryProviders?.detectProvider();
+  if (!provider) return;
+
+  const senderElements = provider.getUnauditedSenderElements();
   
   if (senderElements.length === 0) return;
   
@@ -83,36 +169,17 @@ function auditGmailThreads() {
     const whitelist = settings.whitelist || [];
     
     senderElements.forEach((span) => {
-      // Mark as audited to prevent multiple scans
-      span.setAttribute("data-phish-sentry-audited", "true");
-      
-      const email = span.getAttribute("email");
-      const name = span.textContent || "";
-      const fromHeader = `"${name}" <${email}>`;
-      
-      // Locate the message wrapper
-      const messageWrapper = span.closest(".adn");
-      if (!messageWrapper) return;
-      
-      // Extract all links inside this specific email body (.a3s)
-      const links = [];
-      const bodyContainer = messageWrapper.querySelector(".a3s");
-      if (bodyContainer) {
-        const anchors = bodyContainer.querySelectorAll("a[href]");
-        anchors.forEach(a => {
-          links.push({
-            href: a.getAttribute("href") || "",
-            text: a.textContent || ""
-          });
-        });
-      }
+      provider.markSenderAudited(span);
+      const messageContext = provider.extractMessage(span);
+      if (!messageContext) return;
       
       // Execute the security evaluation using our local engine
-      const assessment = self.PhishSentryEngine.analyze(fromHeader, links, customBrands, whitelist);
+      const assessment = self.PhishSentryEngine.analyze(messageContext.fromHeader, messageContext.links, customBrands, whitelist);
       
       // Update global active state
       activeAssessmentState = {
-        from: name ? `"${name}" <${email}>` : email,
+        from: messageContext.senderDisplayName ? `"${messageContext.senderDisplayName}" <${messageContext.senderEmail}>` : messageContext.senderEmail,
+        provider: messageContext.providerLabel,
         assessment
       };
       
@@ -129,21 +196,21 @@ function auditGmailThreads() {
       });
       
       // Inject visual security badge above the email body container
-      injectSafetyBadge(messageWrapper, assessment, email);
+      injectSafetyBadge(provider, messageContext.messageWrapper, assessment, messageContext.senderEmail);
     });
   });
 }
 
 /**
- * Injects the safety badge inside the Gmail email container DOM.
- * Redesigned to sit right above the email body (.a3s) to prevent overlap.
+ * Injects the safety badge inside the provider message container.
  */
-function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
-  const bodyContainer = messageWrapper.querySelector(".a3s");
-  const headerContainer = messageWrapper.querySelector(".gK") || messageWrapper;
+function injectSafetyBadge(provider, messageWrapper, assessment, senderEmail) {
+  const { bodyContainer, headerContainer } = provider.getInjectionTargets(messageWrapper);
   const status = normalizeStatus(assessment.status);
   const riskScore = normalizeRiskScore(assessment.riskScore);
   const reasons = Array.isArray(assessment.reasons) ? assessment.reasons : [];
+  const senderDomain = assessment.details?.parsedSender?.domain || "unknown-domain";
+  const presentation = getAssessmentPresentation(status, riskScore, assessment);
   
   // Check if we already injected our badge inside this email wrapper
   if (messageWrapper.querySelector(".phish-sentry-injected-badge")) return;
@@ -153,9 +220,9 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
   badge.className = `phish-sentry-injected-badge ps-${status}`;
   
   let iconSvg = "";
-  let statusTitle = "";
-  let descriptionText = "";
-  let auditLabelText = "Examine Security Audit";
+  let statusTitle = presentation.title;
+  let descriptionText = presentation.description;
+  let auditLabelText = presentation.button;
   
   // Elegant SVGs with glow and stroke effects
   if (status === "safe") {
@@ -165,8 +232,6 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         <path d="M9 11L11 13L15 9" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
     `;
-    statusTitle = "VERIFIED SAFE SENDER";
-    descriptionText = reasons[0] || "Sender domain is trusted.";
   } else if (status === "phishing") {
     iconSvg = `
       <svg class="ps-icon svg-phishing" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -175,9 +240,6 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         <line x1="12" y1="16" x2="12.01" y2="16"/>
       </svg>
     `;
-    statusTitle = "CRITICAL PHISHING ALERT";
-    descriptionText = "Danger: Severe security anomalies detected. Do not click links or download files.";
-    auditLabelText = "Review Phishing Flags";
   } else if (status === "suspicious") {
     iconSvg = `
       <svg class="ps-icon svg-suspicious" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -186,8 +248,6 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         <line x1="12" y1="15" x2="12.01" y2="15"/>
       </svg>
     `;
-    statusTitle = "SUSPICIOUS THREAT INDICATOR";
-    descriptionText = "Warning: Some elements of this email appear deceptive. Exercise caution.";
   } else {
     iconSvg = `
       <svg class="ps-icon svg-unknown" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -196,8 +256,6 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         <line x1="12" y1="17" x2="12.01" y2="17"/>
       </svg>
     `;
-    statusTitle = "UNVERIFIED SENDER";
-    descriptionText = "This domain is not in our verified brands database. Standard caution advised.";
   }
   
   // Custom checklist audit lines
@@ -215,20 +273,20 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
       .phish-sentry-injected-badge {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         margin: 16px 24px 16px 24px;
-        padding: 14px 18px;
-        border-radius: 12px;
-        background: rgba(13, 17, 28, 0.96);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255,255,255,0.05);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
+        padding: 16px 18px;
+        border-radius: 18px;
+        background: rgba(248, 249, 251, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.82);
+        box-shadow: 0 18px 44px rgba(15, 23, 42, 0.14), inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -1px 0 rgba(15,23,42,0.04);
+        backdrop-filter: blur(24px) saturate(170%);
+        -webkit-backdrop-filter: blur(24px) saturate(170%);
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 10px;
         font-size: 13px;
-        color: #E5E7EB;
+        color: #1D1D1F;
         animation: ps-slide-down 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-        max-width: 620px;
+        max-width: 680px;
         z-index: 10;
         position: relative;
       }
@@ -239,80 +297,80 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
       
       /* Color Borders & Glows */
       .ps-safe {
-        border-left: 4px solid #10B981;
-        border-color: rgba(16,185,129,0.15) rgba(16,185,129,0.15) rgba(16,185,129,0.15) #10B981;
+        border-left: 4px solid #3A7D58;
+        border-color: rgba(255,255,255,0.82) rgba(255,255,255,0.82) rgba(255,255,255,0.82) #3A7D58;
       }
       .ps-phishing {
-        border-left: 4px solid #EF4444;
-        border-color: rgba(239,68,68,0.15) rgba(239,68,68,0.15) rgba(239,68,68,0.15) #EF4444;
-        box-shadow: 0 12px 36px rgba(239, 68, 68, 0.08), 0 0 1px rgba(239, 68, 68, 0.3);
+        border-left: 4px solid #B42318;
+        border-color: rgba(255,255,255,0.82) rgba(255,255,255,0.82) rgba(255,255,255,0.82) #B42318;
+        box-shadow: 0 20px 48px rgba(180, 35, 24, 0.14), inset 0 1px 0 rgba(255,255,255,0.9);
       }
       .ps-suspicious {
-        border-left: 4px solid #F59E0B;
-        border-color: rgba(245,158,11,0.15) rgba(245,158,11,0.15) rgba(245,158,11,0.15) #F59E0B;
+        border-left: 4px solid #A15C07;
+        border-color: rgba(255,255,255,0.82) rgba(255,255,255,0.82) rgba(255,255,255,0.82) #A15C07;
       }
       .ps-unknown {
-        border-left: 4px solid #8B5CF6;
-        border-color: rgba(139,92,246,0.15) rgba(139,92,246,0.15) rgba(139,92,246,0.15) #8B5CF6;
+        border-left: 4px solid #6E6E73;
+        border-color: rgba(255,255,255,0.82) rgba(255,255,255,0.82) rgba(255,255,255,0.82) #6E6E73;
       }
       
       .ps-row { display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 12px; }
       .ps-left { display: flex; align-items: center; gap: 12px; }
       
       .ps-icon { width: 22px; height: 22px; flex-shrink: 0; }
-      .svg-safe { color: #10B981; filter: drop-shadow(0 0 4px rgba(16, 185, 129, 0.3)); }
-      .svg-phishing { color: #EF4444; filter: drop-shadow(0 0 4px rgba(239, 68, 68, 0.4)); }
-      .svg-suspicious { color: #F59E0B; filter: drop-shadow(0 0 4px rgba(245, 158, 11, 0.3)); }
-      .svg-unknown { color: #8B5CF6; filter: drop-shadow(0 0 4px rgba(139, 92, 246, 0.3)); }
+      .svg-safe { color: #3A7D58; }
+      .svg-phishing { color: #B42318; }
+      .svg-suspicious { color: #A15C07; }
+      .svg-unknown { color: #6E6E73; }
       
       .ps-badge-title {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         font-weight: 700;
         font-size: 12px;
-        letter-spacing: 0.8px;
-        text-transform: uppercase;
+        letter-spacing: 0.2px;
       }
-      .ps-safe .ps-badge-title { color: #10B981; }
-      .ps-phishing .ps-badge-title { color: #EF4444; }
-      .ps-suspicious .ps-badge-title { color: #F59E0B; }
-      .ps-unknown .ps-badge-title { color: #8B5CF6; }
+      .ps-safe .ps-badge-title { color: #2F684A; }
+      .ps-phishing .ps-badge-title { color: #912018; }
+      .ps-suspicious .ps-badge-title { color: #7A4305; }
+      .ps-unknown .ps-badge-title { color: #515154; }
       
-      .ps-desc { font-size: 11px; color: #9CA3AF; margin-top: 2px; font-weight: 400; line-height: 1.35; }
+      .ps-desc { font-size: 11.5px; color: #515154; margin-top: 2px; font-weight: 400; line-height: 1.4; }
       
       .ps-action-group { display: flex; align-items: center; gap: 8px; }
       
       .ps-btn {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.1);
-        color: #F3F4F6;
-        padding: 5px 10px;
-        border-radius: 6px;
+        background: rgba(255,255,255,0.62);
+        border: 1px solid rgba(0,0,0,0.08);
+        color: #1D1D1F;
+        padding: 7px 11px;
+        border-radius: 10px;
         cursor: pointer;
         font-size: 11px;
         font-weight: 600;
-        transition: all 0.2s;
+        transition: background 0.2s, border-color 0.2s, transform 0.2s;
         outline: none;
       }
-      .ps-btn:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.18); }
+      .ps-btn:hover { background: rgba(255,255,255,0.88); border-color: rgba(0,0,0,0.14); transform: translateY(-1px); }
+      .ps-btn:active { transform: translateY(0); }
+      .ps-btn:disabled { opacity: 0.62; cursor: default; transform: none; }
       
       .ps-btn-whitelist {
-        background: rgba(16,185,129,0.08);
-        border: 1px solid rgba(16,185,129,0.2);
-        color: #10B981;
+        background: rgba(29,29,31,0.88);
+        border: 1px solid rgba(29,29,31,0.12);
+        color: #FFFFFF;
       }
       .ps-btn-whitelist:hover {
-        background: rgba(16,185,129,0.15);
-        border-color: rgba(16,185,129,0.35);
-        box-shadow: 0 0 8px rgba(16,185,129,0.1);
+        background: rgba(29,29,31,0.96);
+        border-color: rgba(29,29,31,0.2);
       }
       
       /* Collapsible Panel */
       .ps-expanded-panel {
         display: none;
         margin-top: 8px;
-        border-top: 1px solid rgba(255,255,255,0.06);
-        padding-top: 8px;
-        color: #9CA3AF;
+        border-top: 1px solid rgba(0,0,0,0.06);
+        padding-top: 10px;
+        color: #515154;
         font-size: 11.5px;
         animation: ps-slide-up 0.25s ease-out;
       }
@@ -332,7 +390,7 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
       .ps-progress-bar {
         flex: 1;
         height: 6px;
-        background: rgba(255,255,255,0.05);
+        background: rgba(0,0,0,0.06);
         border-radius: 4px;
         overflow: hidden;
       }
@@ -342,19 +400,60 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         width: 0%;
         transition: width 0.6s ease;
       }
-      .ps-progress-fill.safe { background: #10B981; }
-      .ps-progress-fill.phishing { background: #EF4444; }
-      .ps-progress-fill.suspicious { background: #F59E0B; }
-      .ps-progress-fill.unknown { background: #8B5CF6; }
+      .ps-progress-fill.safe { background: #3A7D58; }
+      .ps-progress-fill.phishing { background: #B42318; }
+      .ps-progress-fill.suspicious { background: #A15C07; }
+      .ps-progress-fill.unknown { background: #8E8E93; }
+      .safe-color { color: #3A7D58; }
+      .phishing-color { color: #B42318; }
+      .suspicious-color { color: #A15C07; }
+      .unknown-color { color: #6E6E73; }
+      .ps-context-line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 12px;
+        margin-bottom: 8px;
+        color: #515154;
+      }
+      .ps-context-line strong,
+      .ps-recommendation strong { color: #1D1D1F; }
+      .ps-recommendation {
+        background: rgba(255,255,255,0.62);
+        border: 1px solid rgba(0,0,0,0.06);
+        border-radius: 12px;
+        padding: 8px 10px;
+        margin-bottom: 8px;
+        color: #3A3A3C;
+      }
       
       .ps-reasons-list { list-style: none; padding: 0; margin: 4px 0 0 0; display: flex; flex-direction: column; gap: 5px; }
       .ps-audit-item { display: flex; align-items: flex-start; gap: 8px; line-height: 1.4; }
       
       .ps-bullet { width: 12px; height: 12px; flex-shrink: 0; margin-top: 2px; }
-      .ps-safe .ps-bullet { color: #10B981; }
-      .ps-phishing .ps-bullet { color: #EF4444; }
-      .ps-suspicious .ps-bullet { color: #F59E0B; }
-      .ps-unknown .ps-bullet { color: #8B5CF6; }
+      .ps-feedback {
+        min-height: 14px;
+        color: #3A7D58;
+        font-size: 11px;
+      }
+      .ps-save-confirmation {
+        display: none;
+        margin-top: -2px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(58, 125, 88, 0.08);
+        border: 1px solid rgba(58, 125, 88, 0.14);
+        color: #2F684A;
+        font-size: 11.5px;
+        line-height: 1.35;
+        animation: ps-slide-up 0.25s ease-out;
+      }
+      .ps-save-confirmation.active {
+        display: block;
+      }
+      .ps-safe .ps-bullet { color: #3A7D58; }
+      .ps-phishing .ps-bullet { color: #B42318; }
+      .ps-suspicious .ps-bullet { color: #A15C07; }
+      .ps-unknown .ps-bullet { color: #6E6E73; }
     </style>
     
     <div class="ps-row">
@@ -373,19 +472,27 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         }
       </div>
     </div>
+
+    <div class="ps-save-confirmation" aria-live="polite"></div>
     
     <div class="ps-expanded-panel">
       <div class="ps-progress-container">
-        <span style="font-weight:600; color:#F3F4F6; min-width: 90px;">PhishSentry Score:</span>
+        <span style="font-weight:600; color:#1D1D1F; min-width: 90px;">Risk score</span>
         <div class="ps-progress-bar">
           <div class="ps-progress-fill ${status}" style="width: ${riskScore || 5}%"></div>
         </div>
-        <span style="font-weight:700;" class="${status}-color">${riskScore}% Threat</span>
+        <span style="font-weight:700;" class="${status}-color">${riskScore}%</span>
       </div>
-      <div style="font-weight:600; color:#F3F4F6; margin-bottom: 4px; font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">Audit Details:</div>
+      <div class="ps-context-line">
+        <span><strong>Sender domain:</strong> ${escapeHtml(senderDomain)}</span>
+        <span><strong>Provider:</strong> ${escapeHtml(provider.label)}</span>
+      </div>
+      <div class="ps-recommendation"><strong>Recommended action:</strong> ${escapeHtml(presentation.action)}</div>
+      <div style="font-weight:600; color:#1D1D1F; margin-bottom: 4px; font-size:11px;">Signals</div>
       <ul class="ps-reasons-list">
         ${reasonsListHTML}
       </ul>
+      <div class="ps-feedback" aria-live="polite"></div>
     </div>
   `;
   
@@ -411,16 +518,16 @@ function injectSafetyBadge(messageWrapper, assessment, senderEmail) {
         if (!whitelist.includes(senderDomain)) {
           whitelist.push(senderDomain);
           chrome.storage.local.set({ whitelist }, () => {
-            alert(`Domain "${senderDomain}" added to trusted whitelist. Re-open this email to refresh protection status.`);
-            badge.remove();
+            applyTrustedSenderState(badge, senderDomain, assessment);
           });
+        } else {
+          applyTrustedSenderState(badge, senderDomain, assessment);
         }
       });
     });
   }
   
-  // Inject right above the email body element (.a3s) so it sits elegantly
-  // below the native Gmail warnings/spam popups and is 100% visible!
+  // Inject right above the email body when the provider exposes that target.
   if (bodyContainer) {
     bodyContainer.parentNode.insertBefore(badge, bodyContainer);
   } else {
