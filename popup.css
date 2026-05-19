@@ -104,11 +104,12 @@ body::before {
 }
 
 .header-logo-svg {
-  width: 28px;
-  height: 28px;
-  padding: 4px;
+  width: 30px;
+  height: 30px;
+  padding: 3px;
   border-radius: 9px;
   background: rgba(255, 255, 255, 0.74);
+  color: var(--text-main);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.92);
 }
 

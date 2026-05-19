@@ -1,158 +1,180 @@
-# PhishSentry Programmatic Icon Generator (Pure Python Runner)
-# 
-# Draws high-fidelity, glowing electric blue security shields with checkmarks
-# at 16x16, 48x48, and 128x128 pixel sizes. Uses only standard libraries
-# (zlib, struct) to output perfect, transparent PNG graphics.
+# PhishSentry Icon Generator
+#
+# Builds simple, neutral Chrome extension icons with only the Python standard
+# library. The mark is intentionally minimal so it remains readable at 16px.
 
 import os
-import zlib
 import struct
-import math
+import zlib
+
 
 def make_chunk(tag, data):
-    return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
 
 def write_png(width, height, pixels):
-    # PNG File Signature
-    png = b'\x89PNG\r\n\x1a\n'
-    
-    # IHDR Chunk
-    ihdr = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
-    png += make_chunk(b'IHDR', ihdr)
-    
-    # IDAT Chunk (zlib compressed pixel rows)
-    raw_data = b''
+    png = b"\x89PNG\r\n\x1a\n"
+    png += make_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+
+    raw_data = b""
     for y in range(height):
-        raw_data += b'\x00' # Filter byte 0 (None)
+        raw_data += b"\x00"
         for x in range(width):
-            r, g, b, a = pixels[y * width + x]
-            raw_data += struct.pack('BBBB', r, g, b, a)
-            
-    idat = zlib.compress(raw_data)
-    png += make_chunk(b'IDAT', idat)
-    
-    # IEND Chunk
-    png += make_chunk(b'IEND', b'')
+            raw_data += struct.pack("BBBB", *pixels[y * width + x])
+
+    png += make_chunk(b"IDAT", zlib.compress(raw_data))
+    png += make_chunk(b"IEND", b"")
     return png
 
+
+def is_inside_rounded_rect(x, y, x0, y0, x1, y1, radius):
+    if x < x0 or x > x1 or y < y0 or y > y1:
+        return False
+
+    if x0 + radius <= x <= x1 - radius:
+        return True
+
+    if y0 + radius <= y <= y1 - radius:
+        return True
+
+    corner_x = x0 + radius if x < x0 + radius else x1 - radius
+    corner_y = y0 + radius if y < y0 + radius else y1 - radius
+    return (x - corner_x) ** 2 + (y - corner_y) ** 2 <= radius ** 2
+
+
+def is_inside_polygon(x, y, points):
+    inside = False
+    j = len(points) - 1
+
+    for i, point in enumerate(points):
+        xi, yi = point
+        xj, yj = points[j]
+        intersects = (yi > y) != (yj > y) and x < ((xj - xi) * (y - yi) / (yj - yi) + xi)
+        if intersects:
+            inside = not inside
+        j = i
+
+    return inside
+
+
 def distance_to_segment(px, py, ax, ay, bx, by):
-    # Distance from point (px, py) to line segment AB
     abx = bx - ax
     aby = by - ay
     apx = px - ax
     apy = py - ay
-    
-    ab_len_sq = abx*abx + aby*aby
-    if ab_len_sq == 0:
-        return math.sqrt(apx*apx + apy*apy)
-        
-    t = max(0, min(1, (apx*abx + apy*aby) / ab_len_sq))
-    proj_x = ax + t * abx
-    proj_y = ay + t * aby
-    
-    return math.sqrt((px - proj_x)**2 + (py - proj_y)**2)
+    length_squared = abx * abx + aby * aby
 
-def generate_shield_pixels(size):
-    pixels = []
-    
+    if length_squared == 0:
+        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+
+    t = max(0, min(1, (apx * abx + apy * aby) / length_squared))
+    projection_x = ax + t * abx
+    projection_y = ay + t * aby
+    return ((px - projection_x) ** 2 + (py - projection_y) ** 2) ** 0.5
+
+
+def downsample(pixels, size, scale):
+    high_size = size * scale
+    downsampled = []
+
     for y in range(size):
         for x in range(size):
-            # Normalize coordinates to [-1.0, 1.0]
-            dx = (x - (size - 1) / 2.0) / (size / 2.0)
-            dy = (y - (size - 1) / 2.0) / (size / 2.0)
-            
-            # Pad slightly so shield doesn't touch boundary
-            dx /= 0.9
-            dy /= 0.9
-            
-            # --- SHIELD BOUNDARY FORMULAS ---
-            # Top Curve
-            top_y = -0.75 + 0.15 * (dx ** 2)
-            # Bottom Point Curves
-            bottom_y = 0.75 - 1.5 * (abs(dx) ** 2)
-            
-            # Left & Right side bounds
-            in_x_bound = abs(dx) <= 0.75
-            
-            # Determine if point is inside shield shape
-            is_inside = False
-            if in_x_bound and dy >= top_y:
-                # Shape pointing downwards
-                # Tip is at (0, 0.75) and sides curve up to (0.75, -0.09)
-                edge_y = 0.75 - 1.12 * abs(dx) - 0.3 * (dx ** 2)
-                if dy <= edge_y:
-                    is_inside = True
-                    
-            # Compute distance to edge for glow/border heuristics
-            # Approximate distance to shield outline
-            edge_dist = 999.0
-            if in_x_bound:
-                dist_top = abs(dy - top_y)
-                edge_y = 0.75 - 1.12 * abs(dx) - 0.3 * (dx ** 2)
-                dist_bottom = abs(dy - edge_y)
-                dist_side = abs(abs(dx) - 0.75) if dy < 0 else 999.0
-                edge_dist = min(dist_top, dist_bottom, dist_side)
-                
-            # Default pixel values (transparent)
-            r, g, b, a = 0, 0, 0, 0
-            
-            if is_inside:
-                # Draw checkmark inside
-                # Segment 1: (-0.22, 0.05) to (-0.05, 0.22)
-                # Segment 2: (-0.05, 0.22) to (0.32, -0.15)
-                dist_check = min(
-                    distance_to_segment(dx, dy, -0.22, 0.05, -0.05, 0.22),
-                    distance_to_segment(dx, dy, -0.05, 0.22, 0.32, -0.15)
-                )
-                
-                # Checkmark thickness (normalized)
-                check_thickness = 0.075
-                
-                if dist_check <= check_thickness:
-                    # Glowing emerald checkmark
-                    r, g, b, a = 16, 185, 129, 255
-                elif edge_dist <= 0.08:
-                    # Glowing electric cyan border
-                    r, g, b, a = 0, 242, 254, 255
-                else:
-                    # Radial gradient inside shield (Navy to deep space blue)
-                    dist_to_center = math.sqrt(dx**2 + (dy + 0.1)**2)
-                    factor = min(1.0, dist_to_center / 0.8)
-                    # Interpolate: center is brighter blue, outer is dark navy
-                    r = int(11 + (15 - 11) * factor)
-                    g = int(80 + (15 - 80) * factor)
-                    b = int(180 + (25 - 180) * factor)
-                    a = 230 # high opacity glassmorphism
+            total_alpha = 0
+            total_red = 0
+            total_green = 0
+            total_blue = 0
+
+            for sample_y in range(scale):
+                for sample_x in range(scale):
+                    source_x = x * scale + sample_x
+                    source_y = y * scale + sample_y
+                    red, green, blue, alpha = pixels[source_y * high_size + source_x]
+                    total_alpha += alpha
+                    total_red += red * alpha
+                    total_green += green * alpha
+                    total_blue += blue * alpha
+
+            sample_count = scale * scale
+            alpha = round(total_alpha / sample_count)
+
+            if total_alpha:
+                red = round(total_red / total_alpha)
+                green = round(total_green / total_alpha)
+                blue = round(total_blue / total_alpha)
             else:
-                # Outer Glow: if just outside the shield edge, add a soft blue neon aura
-                if edge_dist <= 0.12 and dy >= top_y - 0.12:
-                    # Distance factor
-                    glow_factor = (0.12 - edge_dist) / 0.12
-                    r = 0
-                    g = 242
-                    b = 254
-                    a = int(60 * (glow_factor ** 2)) # soft fadeout
-                    
-            pixels.append((r, g, b, a))
-            
-    return pixels
+                red = green = blue = 0
+
+            downsampled.append((red, green, blue, alpha))
+
+    return downsampled
+
+
+def generate_icon_pixels(size):
+    scale = 4
+    high_size = size * scale
+    pixels = []
+
+    background = (247, 248, 250, 255)
+    border = (218, 220, 226, 255)
+    shield = (29, 29, 31, 255)
+    check = (255, 255, 255, 255)
+
+    shield_points = [
+        (0.50, 0.20),
+        (0.73, 0.31),
+        (0.68, 0.63),
+        (0.50, 0.80),
+        (0.32, 0.63),
+        (0.27, 0.31),
+    ]
+
+    for y in range(high_size):
+        for x in range(high_size):
+            nx = (x + 0.5) / high_size
+            ny = (y + 0.5) / high_size
+            color = (0, 0, 0, 0)
+
+            border_width = max(0.012, 1.0 / size)
+            outer = is_inside_rounded_rect(nx, ny, 0.045, 0.045, 0.955, 0.955, 0.20)
+            inner = is_inside_rounded_rect(
+                nx,
+                ny,
+                0.045 + border_width,
+                0.045 + border_width,
+                0.955 - border_width,
+                0.955 - border_width,
+                0.20 - border_width,
+            )
+
+            if outer:
+                color = background if inner else border
+
+            if is_inside_polygon(nx, ny, shield_points):
+                color = shield
+
+            check_width = 0.052
+            check_distance = min(
+                distance_to_segment(nx, ny, 0.39, 0.52, 0.47, 0.60),
+                distance_to_segment(nx, ny, 0.47, 0.60, 0.63, 0.42),
+            )
+            if check_distance <= check_width:
+                color = check
+
+            pixels.append(color)
+
+    return downsample(pixels, size, scale)
+
 
 def main():
-    icons_dir = "icons"
-    if not os.path.exists(icons_dir):
-        os.makedirs(icons_dir)
-        print(f"Created '{icons_dir}' directory.")
-        
-    sizes = [16, 48, 128]
-    for size in sizes:
-        pixels = generate_shield_pixels(size)
-        png_data = write_png(size, size, pixels)
-        
-        file_path = os.path.join(icons_dir, f"icon{size}.png")
-        with open(file_path, "wb") as f:
-            f.write(png_data)
-            
-        print(f"Successfully generated {size}x{size} icon: {file_path}")
+    os.makedirs("icons", exist_ok=True)
+
+    for size in (16, 48, 128):
+        pixels = generate_icon_pixels(size)
+        file_path = os.path.join("icons", f"icon{size}.png")
+        with open(file_path, "wb") as file:
+            file.write(write_png(size, size, pixels))
+        print(f"Generated {file_path}")
+
 
 if __name__ == "__main__":
     main()

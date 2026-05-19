@@ -14,6 +14,8 @@ desktop.ini
 logs/
 tmp/
 temp/
+__pycache__/
+*.pyc
 
 # Local secrets and release-only artifacts
 .env
